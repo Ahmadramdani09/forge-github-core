@@ -194,64 +194,66 @@ function commitLevels(repo: Repo, tip: string): Map<string, number> {
   return levels;
 }
 
-function hasParents(repo: Repo, oid: string): boolean {
-  const obj = repo.store.get(oid);
-  return !!obj && obj.type === 'commit' && parseCommit(obj.data).parents.length > 0;
+/**
+ * The commits reachable from `seeds` without expanding the parents of
+ * `stopAt` commits: what a shallow client actually holds when its boundary
+ * commits are in `stopAt` (their ancestors are named on the server side but
+ * were never sent).
+ */
+function truncatedClosure(repo: Repo, seeds: string[], stopAt: Set<string>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...seeds];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    const obj = repo.store.get(oid);
+    if (!obj || obj.type !== 'commit') continue;
+    seen.add(oid);
+    if (stopAt.has(oid)) continue;
+    stack.push(...parseCommit(obj.data).parents);
+  }
+  return seen;
 }
 
-function planShallow(repo: Repo, args: FetchArgs, wantClosure: Set<string>, haveClosure: Set<string>): ShallowPlan {
+/**
+ * Shallow fetch planning. `deepen N` is the target total depth measured from
+ * the wants (the protocol's meaning), and the `shallow` lines name the
+ * client's current boundary. The new boundary is recomputed from what the
+ * client holds after the fetch: a present commit whose parents are not all
+ * present.
+ */
+function planShallow(repo: Repo, args: FetchArgs, wantClosure: Set<string>): ShallowPlan {
+  const boundarySet = new Set(args.shallowLines);
+  const held = truncatedClosure(repo, [...args.haves, ...args.shallowLines], boundarySet);
   const include = new Set<string>();
-  const boundary = new Set<string>();
-  const unshallow: string[] = [];
-  const depth = args.deepen;
-  if (args.shallowLines.length === 0) {
-    // Fresh shallow fetch: keep `depth` levels from each want.
-    const limit = depth ?? 1;
+  if (args.deepen !== undefined) {
     for (const want of args.wants) {
       const levels = commitLevels(repo, want);
       for (const [oid, level] of levels) {
-        if (level <= limit) {
-          include.add(oid);
-          if (level === limit && hasParents(repo, oid)) boundary.add(oid);
-        }
+        if (level <= args.deepen) include.add(oid);
       }
-    }
-    return { commits: include, boundary: [...boundary], unshallow };
-  }
-  if (depth !== undefined) {
-    // Deepening: extend each boundary commit by `depth` more levels.
-    for (const boundaryOid of args.shallowLines) {
-      const levels = commitLevels(repo, boundaryOid);
-      let reachedEnd = true;
-      for (const [oid, level] of levels) {
-        if (oid === boundaryOid) continue;
-        if (level - 1 <= depth) {
-          include.add(oid);
-          if (level - 1 === depth && hasParents(repo, oid)) {
-            boundary.add(oid);
-            reachedEnd = false;
-          }
-        } else {
-          reachedEnd = false;
-        }
-      }
-      if (reachedEnd) unshallow.push(boundaryOid);
     }
   } else {
-    // No deepening: the boundary stays exactly where it was.
-    for (const boundaryOid of args.shallowLines) boundary.add(boundaryOid);
+    const belowBoundary = new Set<string>();
+    for (const boundaryOid of boundarySet) {
+      for (const oid of reachableCommits(repo.store, boundaryOid)) belowBoundary.add(oid);
+    }
+    for (const oid of wantClosure) {
+      if (!belowBoundary.has(oid)) include.add(oid);
+    }
   }
-  // Commits above the boundary that the client lacks (a new tip fetched into
-  // an existing shallow clone) ride along in both cases.
-  const boundaryClosure = new Set<string>();
-  for (const boundaryOid of args.shallowLines) {
-    for (const oid of reachableCommits(repo.store, boundaryOid)) boundaryClosure.add(oid);
+  const deliver = new Set<string>();
+  for (const oid of include) if (!held.has(oid)) deliver.add(oid);
+  const present = new Set<string>([...held, ...deliver]);
+  const newBoundary = new Set<string>();
+  for (const oid of [...deliver, ...boundarySet]) {
+    const obj = repo.store.get(oid);
+    if (!obj || obj.type !== 'commit') continue;
+    const parents = parseCommit(obj.data).parents;
+    if (parents.length > 0 && parents.some((parent) => !present.has(parent))) newBoundary.add(oid);
   }
-  for (const oid of wantClosure) {
-    if (!haveClosure.has(oid) && !boundaryClosure.has(oid)) include.add(oid);
-  }
-  for (const boundaryOid of args.shallowLines) include.delete(boundaryOid);
-  return { commits: include, boundary: [...boundary], unshallow };
+  const unshallow = args.shallowLines.filter((oid) => !newBoundary.has(oid));
+  return { commits: deliver, boundary: [...newBoundary], unshallow };
 }
 
 function sidebandChunks(data: Buffer): Buffer[] {
@@ -285,7 +287,7 @@ function computeFetch(repo: Repo, args: FetchArgs): { packObjects: Map<string, {
     const objects = objectsToSend(store, args.wants, haveClosure);
     return { packObjects: objects as Map<string, { type: string; data: Buffer }>, shallow: null, common };
   }
-  const plan = planShallow(repo, args, wantCommits, haveClosure);
+  const plan = planShallow(repo, args, wantCommits);
   const include = plan.commits;
   if (include.size === 0) {
     return { packObjects: null, shallow: plan, common };
