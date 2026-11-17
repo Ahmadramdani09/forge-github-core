@@ -1,7 +1,8 @@
 // The GitHub REST v3 surface: repositories, branches, commits, contents,
 // labels, issues, comments and pull requests, in GitHub's shapes and statuses.
 
-import { Forge, Repo, Issue, Pull, squashMerge, ZERO_OID } from './store.ts';
+import { Forge, squashMerge, ZERO_OID } from './store.ts';
+import type { Repo, Issue, Pull } from './store.ts';
 import { parseCommit, mergeBase } from './gitobj.ts';
 
 export interface RestRequest {
@@ -274,6 +275,19 @@ function handleRepoScoped(forge: Forge, repo: Repo, seg: string[], req: RestRequ
       .filter(([ref]) => ref.startsWith('refs/heads/'))
       .map(([ref, sha]) => ({ name: ref.slice('refs/heads/'.length), commit: { sha }, protected: false }));
     return { status: 200, body: branches };
+  }
+
+  if (seg[0] === 'branches' && seg.length === 2 && method === 'GET') {
+    const sha = repo.branchTip(seg[1]);
+    if (!sha) return notFound();
+    return { status: 200, body: { name: seg[1], commit: { sha }, protected: false } };
+  }
+
+  if (seg[0] === 'git' && seg[1] === 'refs' && seg.length > 2 && method === 'GET') {
+    const ref = `refs/${seg.slice(2).join('/')}`;
+    const sha = repo.refs.get(ref);
+    if (!sha) return notFound();
+    return { status: 200, body: { ref, node_id: nodeId('Ref', repo.id), object: { sha, type: 'commit' } } };
   }
 
   if (seg[0] === 'commits' && seg.length === 1 && method === 'GET') {

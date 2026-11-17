@@ -232,8 +232,26 @@ export function objectsToSend(store: ObjectStore, tips: string[], excludeCommits
       }
     }
   };
+  // Tips may name annotated tags: include the tag object and follow it to
+  // the commit it names (possibly through nested tags).
+  const commitTips: string[] = [];
+  for (const tip of tips) {
+    let current = tip;
+    for (;;) {
+      const obj = store.get(current);
+      if (!obj || obj.type !== 'tag') break;
+      if (!excluded.has(current)) out.set(current, obj);
+      const match = /^object ([0-9a-f]{40})$/m.exec(obj.data.toString('utf8'));
+      if (!match) {
+        current = '';
+        break;
+      }
+      current = match[1];
+    }
+    if (current !== '') commitTips.push(current);
+  }
   const seenCommits = new Set<string>();
-  const stack = [...tips];
+  const stack = [...commitTips];
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (seenCommits.has(oid) || excludeCommits.has(oid)) continue;
