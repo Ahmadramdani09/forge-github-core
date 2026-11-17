@@ -178,14 +178,15 @@ interface ShallowPlan {
   unshallow: string[];
 }
 
-/** BFS levels from a tip: commit -> depth (1 = the tip itself). */
-function commitLevels(repo: Repo, tip: string): Map<string, number> {
+/** BFS levels from a tip: commit -> depth (1 = the tip itself), pruned at maxDepth. */
+function commitLevels(repo: Repo, tip: string, maxDepth = Number.POSITIVE_INFINITY): Map<string, number> {
   const levels = new Map<string, number>();
   const queue: [string, number][] = [[tip, 1]];
   while (queue.length > 0) {
     const [oid, depth] = queue.shift() as [string, number];
     if (levels.has(oid) && (levels.get(oid) as number) <= depth) continue;
     levels.set(oid, depth);
+    if (depth >= maxDepth) continue;
     const obj = repo.store.get(oid);
     if (obj && obj.type === 'commit') {
       for (const parent of parseCommit(obj.data).parents) queue.push([parent, depth + 1]);
@@ -228,7 +229,7 @@ function planShallow(repo: Repo, args: FetchArgs, wantClosure: Set<string>): Sha
   const include = new Set<string>();
   if (args.deepen !== undefined) {
     for (const want of args.wants) {
-      const levels = commitLevels(repo, want);
+      const levels = commitLevels(repo, want, args.deepen);
       for (const [oid, level] of levels) {
         if (level <= args.deepen) include.add(oid);
       }
@@ -270,22 +271,28 @@ function sidebandChunks(data: Buffer): Buffer[] {
 function computeFetch(repo: Repo, args: FetchArgs): { packObjects: Map<string, { type: string; data: Buffer }> | null; shallow: ShallowPlan | null; common: string[] } {
   const store = repo.store;
   const common = args.haves.filter((have) => store.has(have));
-  const haveClosure = new Set<string>();
-  for (const have of common) {
-    for (const oid of reachableCommits(store, have)) haveClosure.add(oid);
-  }
-  const wantCommits = new Set<string>();
-  for (const want of args.wants) {
-    for (const oid of reachableCommits(store, want)) wantCommits.add(oid);
-  }
   const shallowMode = args.deepen !== undefined || args.shallowLines.length > 0;
   if (!shallowMode) {
+    const haveClosure = new Set<string>();
+    for (const have of common) {
+      for (const oid of reachableCommits(store, have)) haveClosure.add(oid);
+    }
+    const wantCommits = new Set<string>();
+    for (const want of args.wants) {
+      for (const oid of reachableCommits(store, want)) wantCommits.add(oid);
+    }
     const fresh = [...wantCommits].filter((oid) => !haveClosure.has(oid));
     if (fresh.length === 0 && args.wants.length > 0) {
       return { packObjects: null, shallow: null, common };
     }
     const objects = objectsToSend(store, args.wants, haveClosure);
     return { packObjects: objects as Map<string, { type: string; data: Buffer }>, shallow: null, common };
+  }
+  const wantCommits = new Set<string>();
+  if (args.deepen === undefined) {
+    for (const want of args.wants) {
+      for (const oid of reachableCommits(store, want)) wantCommits.add(oid);
+    }
   }
   const plan = planShallow(repo, args, wantCommits);
   const include = plan.commits;
